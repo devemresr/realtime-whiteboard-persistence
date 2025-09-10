@@ -24,7 +24,7 @@ app.use(express.urlencoded({ extended: false }));
 
 const persistenceController = new PersistenceController();
 persistenceController
-	.initalize()
+	.initialize()
 	.then(() => console.log('persistence server initialized'))
 	.catch((err) => {
 		console.log('error at initializing the persistence server:', err);

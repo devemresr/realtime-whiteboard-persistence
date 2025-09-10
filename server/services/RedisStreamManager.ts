@@ -39,6 +39,9 @@ interface ConsumerOptions {
 	count?: number;
 	blockTime?: number;
 	processingTimeout?: number;
+	timeoutCheckInterval?: number;
+	// timeoutHandler?: () => Promise<void>;
+	timeoutHandler?: any;
 }
 
 interface MessageData {
@@ -55,6 +58,8 @@ class RedisStreamManager {
 	private isConnected: boolean = false;
 	private streamName: string | null = null;
 	private consumerName: string;
+	private lastTimeoutCheck: number = 0;
+	private TIMEOUT_CHECK_INTERVAL: number = 10 * 1000;
 
 	constructor() {
 		this.consumerName = process.env.CONSUMER_NAME || `consumer-${process.pid}`;
@@ -156,13 +161,30 @@ class RedisStreamManager {
 		messageHandler: MessageHandler,
 		options: ConsumerOptions = {}
 	) {
-		const { count = 1, blockTime = 1000, processingTimeout = 30000 } = options;
+		const {
+			count = 1,
+			blockTime = 1000,
+			processingTimeout = 30000,
+			timeoutHandler,
+			// timeoutCheckInterval = 15000,
+			timeoutCheckInterval = 5000,
+		} = options;
 
 		console.log(
 			`Starting consumer '${this.consumerName}' for group '${group}' on stream '${stream}'`
 		);
 
 		while (true) {
+			if (
+				timeoutHandler &&
+				Date.now() - this.lastTimeoutCheck > timeoutCheckInterval
+			) {
+				console.log('calling timeoutHandler');
+
+				await timeoutHandler();
+				this.lastTimeoutCheck = Date.now();
+			}
+
 			const rawMessages = await this.redis!.xreadgroup(
 				'GROUP',
 				group,
@@ -188,7 +210,7 @@ class RedisStreamManager {
 				: null;
 
 			try {
-				// Read pending messages first (messages that were delivered but not acknowledged)
+				// todo add Read pending messages first (messages that were delivered but not acknowledged)
 
 				// Read new messages
 				if (messages && messages.length > 0) {
