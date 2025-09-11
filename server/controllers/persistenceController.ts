@@ -2,6 +2,9 @@ import Redis from 'ioredis';
 import RedisStreamManager from '../services/RedisStreamManager';
 import { REDIS_STREAM_EVENTS } from '../shared/constants/socketIoConstants';
 import RoomData, { RoomDataBase } from '../schemas/Strokes';
+import addToTheRoomAndCheckThreshold from '../scripts/redis/addToTheRoomAndCheckThreshold';
+import getRoomBatchDataScript from '../scripts/redis/getRoomBatchDataScript';
+import cleanupProcessedStrokesScript from '../scripts/redis/cleanupProcessedStrokesScript';
 
 interface RoomMetadata {
 	roomId: string;
@@ -17,14 +20,17 @@ interface BatchProcessingConfig {
 	consumerGroup: string;
 }
 
+interface RoomBatchData {
+	strokeCount: number;
+	strokesData: string[];
+	isTimedOut: boolean;
+}
+
 class DrawingPersistenceManager {
 	private readonly streamManager: RedisStreamManager;
 	private readonly redis: Redis;
 	private readonly config: BatchProcessingConfig;
-
 	private isInitialized = false;
-	private roomsBeingProcessed = new Set<string>();
-
 	private readonly redisConfig = {
 		host: 'localhost',
 		port: 6380,
@@ -56,8 +62,8 @@ class DrawingPersistenceManager {
 			this.streamManager.consumeFromGroup(
 				REDIS_STREAM_EVENTS.DRAWING_EVENT,
 				this.config.consumerGroup,
-				this.handleDrawingEvent.bind(this),
-				{ timeoutHandler: this.processTimedOutRooms.bind(this) }
+				this.handleDrawingEvent.bind(this)
+				// { timeoutHandler: this.processTimedOutRooms.bind(this) }
 			);
 
 			this.isInitialized = true;
@@ -79,106 +85,95 @@ class DrawingPersistenceManager {
 			const { messageData } = data.data;
 			const roomId = messageData.roomId;
 
-			await this.addStrokeToRoom(roomId, messageData);
+			// await this.redis.flushall();
 
-			const shouldTriggerBatch = await this.shouldTriggerBatchWrite(roomId);
-			if (shouldTriggerBatch) {
-				// Process batch asynchronously without blocking message processing
-				this.processBatchWrite(roomId).catch((error) => {
-					console.error(`Batch write failed for room ${roomId}:`, error);
-					// TODO: Add room to retry queue
-				});
-			}
+			await this.addStrokeToRoom(roomId, messageData);
 		} catch (error) {
 			console.error('Error handling drawing event:', error);
 			throw error;
 		}
 	}
 
-	private async processTimedOutRooms(): Promise<void> {
-		const activeRoomIds = await this.getActiveRoomIds();
-		console.log('Checking timed out rooms:', activeRoomIds);
+	// private async processTimedOutRooms(): Promise<void> {
+	// 	const activeRoomIds = await this.getActiveRoomIds();
+	// 	console.log('Checking timed out rooms:', activeRoomIds);
 
-		const timeoutPromises = activeRoomIds.map((roomId) =>
-			this.checkAndProcessTimedOutRoom(roomId)
-		);
+	// 	const timeoutPromises = activeRoomIds.map((roomId) =>
+	// 		this.checkAndProcessTimedOutRoom(roomId)
+	// 	);
 
-		await Promise.all(timeoutPromises);
-	}
+	// 	await Promise.all(timeoutPromises);
+	// }
 
 	// ========== Room Management ==========
-
 	private async addStrokeToRoom(
 		roomId: string,
 		strokeData: any
 	): Promise<void> {
 		try {
-			await this.ensureRoomExists(roomId);
-			await this.incrementRoomStrokeCount(roomId, strokeData);
+			const roomKey = this.getRoomKey(roomId);
+			const strokesKey = this.getRoomStrokesKey(roomId);
+			const now = Date.now();
+			console.log('added to the room');
+
+			const shouldTriggerBatchWriteResult = (await this.redis.eval(
+				addToTheRoomAndCheckThreshold,
+				2, // number of KEYS
+				roomKey,
+				strokesKey,
+				roomId,
+				JSON.stringify(strokeData),
+				now.toString(),
+				this.config.strokeCountThreshold
+			)) as [number, number];
+			const shouldTriggerBatchWrite = shouldTriggerBatchWriteResult[1];
+			if (shouldTriggerBatchWrite) {
+				const lockKey = `lock:room:${roomId}`;
+				const lockValue = `${process.pid}-${Date.now()}`; // unique identifier
+				const acquired = await this.redis.set(
+					lockKey,
+					lockValue,
+					'EX',
+					30, // 30 second timeout for database operations
+					'NX'
+				);
+
+				console.log('acquired', acquired);
+
+				if (!acquired) {
+					console.log(
+						`Room ${roomId} is already being processed by another instance`
+					);
+					return; // Another process is handling this room
+				}
+
+				// Process batch write asynchronously but handle lock release properly
+				this.processBatchWriteWithLock(roomId, lockKey, lockValue).catch(
+					(error: any) => {
+						console.error(`Batch write failed for room ${roomId}:`, error);
+					}
+				);
+			}
 		} catch (error) {
 			console.error(`Error adding stroke to room ${roomId}:`, error);
 			throw error;
 		}
 	}
 
-	private async ensureRoomExists(roomId: string): Promise<void> {
-		const roomKey = this.getRoomKey(roomId);
-		const roomExists = await this.redis.exists(roomKey);
-
-		if (!roomExists) {
-			const initialMetadata: RoomMetadata = {
-				roomId,
-				strokeCount: 0,
-				createdAt: Date.now(),
-				lastUpdated: Date.now(),
-				isTimedOut: false,
-			};
-
-			await this.setRoomMetadata(roomKey, initialMetadata);
-			await this.addToActiveRooms(roomId);
-			console.log(`Created new room: ${roomId}`);
-		}
-	}
-
-	private async incrementRoomStrokeCount(
-		roomId: string,
-		strokeData: any
-	): Promise<void> {
-		const roomKey = this.getRoomKey(roomId);
-		const strokesKey = this.getRoomStrokesKey(roomId);
-
-		const pipeline = this.redis.multi();
-		pipeline.hincrby(roomKey, 'strokeCount', 1);
-		pipeline.hset(roomKey, 'lastUpdated', Date.now());
-		pipeline.sadd(strokesKey, JSON.stringify(strokeData));
-		pipeline.sadd('activeRooms', roomId);
-		pipeline.expire('activeRooms', 3600); // 1 hour TTL
-
-		await pipeline.exec();
-	}
-
 	// ========== Batch Processing ==========
-
-	private async shouldTriggerBatchWrite(roomId: string): Promise<boolean> {
-		const strokeCount = await this.getRoomStrokeCount(roomId);
-		return strokeCount >= this.config.strokeCountThreshold;
-	}
-
-	private async processBatchWrite(roomId: string): Promise<void> {
-		// Prevent concurrent processing of the same room
-		if (this.roomsBeingProcessed.has(roomId)) {
-			console.log(`Room ${roomId} is already being processed, skipping...`);
-			return;
-		}
-
+	private async processBatchWriteWithLock(
+		roomId: string,
+		lockKey: string,
+		lockValue: string
+	): Promise<void> {
 		try {
-			this.roomsBeingProcessed.add(roomId);
-
-			const batchData = await this.getRoomBatchData(roomId);
-			if (!this.isBatchWriteNeeded(batchData)) {
-				console.log(`Room ${roomId} no longer meets batch criteria`);
-				return;
-			}
+			// get the roomData via lua script
+			const raw = await this.getRoomBatchData(roomId);
+			const batchData: RoomBatchData = {
+				strokeCount: raw.strokeCount,
+				strokesData: raw.strokesData,
+				isTimedOut: raw.isTimedOut,
+			};
 
 			const validStrokes = this.parseAndValidateStrokes(batchData.strokesData);
 			if (validStrokes.length === 0) {
@@ -187,9 +182,7 @@ class DrawingPersistenceManager {
 				return;
 			}
 
-			await this.persistStrokesToDatabase(validStrokes);
-			await this.cleanupProcessedStrokes(roomId, batchData.strokesData);
-
+			await this.persistStrokesToDatabase(roomId, validStrokes);
 			console.log(
 				`Successfully batch processed ${validStrokes.length} strokes for room ${roomId}`
 			);
@@ -197,26 +190,44 @@ class DrawingPersistenceManager {
 			console.error(`Error in batch processing for room ${roomId}:`, error);
 			throw error;
 		} finally {
-			this.roomsBeingProcessed.delete(roomId);
+			await this.releaseLockIfOwned(lockKey, lockValue);
+		}
+	}
+	private async releaseLockIfOwned(
+		lockKey: string,
+		lockValue: string
+	): Promise<void> {
+		const luaScript = `
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`;
+
+		try {
+			await this.redis.eval(luaScript, 1, lockKey, lockValue);
+		} catch (error) {
+			console.error('Failed to release lock:', error);
 		}
 	}
 
-	private async checkAndProcessTimedOutRoom(roomId: string): Promise<void> {
-		const roomKey = this.getRoomKey(roomId);
-		const lastUpdated = await this.getRoomLastUpdated(roomId);
+	// private async checkAndProcessTimedOutRoom(roomId: string): Promise<void> {
+	// 	const roomKey = this.getRoomKey(roomId);
+	// 	const lastUpdated = await this.getRoomLastUpdated(roomId);
 
-		if (!lastUpdated) return;
+	// 	if (!lastUpdated) return;
 
-		const timeSinceUpdate = Date.now() - lastUpdated;
-		if (timeSinceUpdate > this.config.timeoutMs) {
-			const hasUnprocessedStrokes = await this.hasUnprocessedStrokes(roomId);
-			if (hasUnprocessedStrokes) {
-				console.log(`Processing timed out room: ${roomId}`);
-				await this.markRoomAsTimedOut(roomId);
-				await this.processBatchWrite(roomId);
-			}
-		}
-	}
+	// 	const timeSinceUpdate = Date.now() - lastUpdated;
+	// 	if (timeSinceUpdate > this.config.timeoutMs) {
+	// 		const hasUnprocessedStrokes = await this.hasUnprocessedStrokes(roomId);
+	// 		if (hasUnprocessedStrokes) {
+	// 			console.log(`Processing timed out room: ${roomId}`);
+	// 			await this.markRoomAsTimedOut(roomId);
+	// 			// await this.processBatchWrite(roomId);
+	// 		}
+	// 	}
+	// }
 
 	// ========== Data Retrieval Helpers ==========
 
@@ -224,33 +235,23 @@ class DrawingPersistenceManager {
 		const roomKey = this.getRoomKey(roomId);
 		const strokesKey = this.getRoomStrokesKey(roomId);
 
-		const pipeline = this.redis.multi();
-		pipeline.hget(roomKey, 'strokeCount');
-		pipeline.smembers(strokesKey);
-		pipeline.hget(roomKey, 'isTimedOut');
-
-		const results = await pipeline.exec();
-		if (!results || results.length < 3) {
-			throw new Error('Failed to retrieve room batch data');
-		}
+		const res = await this.redis.eval(
+			getRoomBatchDataScript,
+			2, // number of KEYS
+			roomKey,
+			strokesKey
+		);
+		const [strokeCountStr, strokesData, isTimedOutStr] = res as [
+			string,
+			string[],
+			string,
+		];
 
 		return {
-			strokeCount: parseInt((results[0][1] as string) || '0'),
-			strokesData: results[1][1] as string[],
-			isTimedOut: results[2][1] === '1',
+			strokeCount: parseInt(strokeCountStr || '0'),
+			strokesData,
+			isTimedOut: isTimedOutStr === '1',
 		};
-	}
-
-	private isBatchWriteNeeded(batchData: {
-		strokeCount: number;
-		strokesData: string[];
-		isTimedOut: boolean;
-	}): boolean {
-		const hasStrokes = batchData.strokesData.length > 0;
-		const meetsThreshold =
-			batchData.strokeCount >= this.config.strokeCountThreshold ||
-			batchData.isTimedOut;
-		return hasStrokes && meetsThreshold;
 	}
 
 	private parseAndValidateStrokes(strokesData: string[]): RoomDataBase[] {
@@ -269,6 +270,7 @@ class DrawingPersistenceManager {
 	// ========== Database Operations ==========
 
 	private async persistStrokesToDatabase(
+		roomId: string,
 		strokes: RoomDataBase[]
 	): Promise<void> {
 		const operations = strokes.map((stroke) => ({
@@ -276,42 +278,133 @@ class DrawingPersistenceManager {
 		}));
 
 		try {
-			const result = await RoomData.bulkWrite(operations);
-			console.log('Database bulk insert result:', result);
+			const result = await RoomData.bulkWrite(operations, { ordered: false }); // Continue processing even if some operations fail
+			console.log('Database bulk insert result:', {
+				insertedCount: result.insertedCount,
+				matchedCount: result.matchedCount,
+				modifiedCount: result.modifiedCount,
+				upsertedCount: result.upsertedCount,
+			});
+			// this.cleanupProcessedStrokes(roomId, strokes);
+
+			// Handle partial failures
+			const successfulInserts = result.insertedCount || 0;
+			const failedInserts = strokes.length - successfulInserts;
+
+			if (failedInserts > 0) {
+				console.warn(
+					`${failedInserts} out of ${strokes.length} inserts failed for room ${roomId}`
+				);
+
+				// Clean up only successful strokes (if you can identify them)
+				await this.cleanupSuccessfulStrokes(roomId, strokes, result);
+			} else {
+				// All inserts was successful
+				await this.cleanupProcessedStrokes(roomId, strokes);
+			}
 		} catch (error) {
 			console.error('Database bulk insert failed:', error);
+
+			// Don't cleanup any strokes if the entire batch failed
+			// They will be retried in the next batch
 			throw error;
+		}
+	}
+	private async cleanupSuccessfulStrokes(
+		roomId: string,
+		originalStrokes: RoomDataBase[],
+		bulkWriteResult: any
+	): Promise<void> {
+		if (originalStrokes.every((stroke) => stroke.packageId)) {
+			// if theres packageId in each element is truthy then proceed
+			const insertedIds = await this.getInsertedStrokeIds(originalStrokes);
+
+			const successfulStrokes = originalStrokes.filter((stroke) =>
+				insertedIds.includes(stroke.packageId)
+			);
+			console.log(
+				'insertedIds',
+				insertedIds,
+				'originalStrokes',
+				originalStrokes,
+				'successfulStrokes',
+				successfulStrokes
+			);
+			// get the successfulStrokes by comparing which stroke has been actually written (mongodb doesnt return which documents was successfuly written so we querry and compare)
+			await this.cleanupProcessedStrokes(roomId, successfulStrokes);
+			return;
+		}
+	}
+
+	private async getInsertedStrokeIds(
+		strokes: RoomDataBase[]
+	): Promise<string[]> {
+		const ids = strokes
+			.map((stroke: RoomDataBase) => stroke?.packageId)
+			.filter(Boolean);
+
+		if (ids.length === 0) return [];
+
+		try {
+			const insertedDocs = await RoomData.find({
+				packageId: { $in: ids },
+			})
+				.select('packageId')
+				.lean();
+			console.log('insertedDocs', insertedDocs);
+
+			return insertedDocs.map((doc) => doc.packageId.toString());
+		} catch (error) {
+			console.error('Failed to verify inserted strokes:', error);
+			return [];
 		}
 	}
 
 	private async cleanupProcessedStrokes(
 		roomId: string,
-		processedStrokes: string[]
+		processedStrokes: RoomDataBase[]
 	): Promise<void> {
 		const roomKey = this.getRoomKey(roomId);
 		const strokesKey = this.getRoomStrokesKey(roomId);
 
-		// Remove processed strokes
-		const pipeline = this.redis.pipeline();
-		processedStrokes.forEach((stroke) => {
-			pipeline.srem(strokesKey, stroke);
-		});
-
-		// Update room metadata
-		pipeline.hget(roomKey, 'strokeCount');
-		const results = await pipeline.exec();
-
-		if (results && results.length > 0) {
-			const currentCount = parseInt(
-				(results[results.length - 1][1] as string) || '0'
+		try {
+			// Prepare arguments for Lua script
+			const strokeJsonStrings = processedStrokes.map((stroke) =>
+				JSON.stringify(stroke)
 			);
-			const newCount = Math.max(0, currentCount - processedStrokes.length);
+			const args = [
+				processedStrokes.length.toString(),
+				Date.now().toString(),
+				...strokeJsonStrings,
+			];
 
-			await this.redis.hset(roomKey, {
-				strokeCount: newCount.toString(),
-				lastProcessed: Date.now().toString(),
-				isTimedOut: '0',
+			const result = (await this.redis.eval(
+				cleanupProcessedStrokesScript,
+				2, // Number of KEYS
+				roomKey,
+				strokesKey,
+				...args
+			)) as [number, number, number];
+
+			const [removedCount, newCount, previousCount] = result;
+
+			console.log(`Cleanup results for room ${roomId}:`, {
+				processedStrokes: processedStrokes.length,
+				actuallyRemoved: removedCount,
+				previousCount,
+				newCount,
 			});
+
+			// Remove room from active rooms if no strokes left
+			if (newCount === 0) {
+				await this.removeFromActiveRooms(roomId);
+			}
+		} catch (error) {
+			console.error(
+				`Failed to cleanup processed strokes for room ${roomId}:`,
+				error
+			);
+			throw error;
 		}
 	}
 

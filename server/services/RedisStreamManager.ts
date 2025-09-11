@@ -180,7 +180,6 @@ class RedisStreamManager {
 				Date.now() - this.lastTimeoutCheck > timeoutCheckInterval
 			) {
 				console.log('calling timeoutHandler');
-
 				await timeoutHandler();
 				this.lastTimeoutCheck = Date.now();
 			}
