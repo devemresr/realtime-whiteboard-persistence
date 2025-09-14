@@ -26,7 +26,7 @@ if roomExists == 0 then
         "isTimedOut", "false"
     )
     redis.call("SADD", "activeRooms", roomId)
-    redis.call("EXPIRE", "activeRooms", 3600) -- 1 hour TTL
+    redis.call("EXPIRE", "activeRooms", 3600) -- 1 hour TTL as fallback
 end
 
 -- Increment stroke count & update metadata

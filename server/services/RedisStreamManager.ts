@@ -59,7 +59,6 @@ class RedisStreamManager {
 	private streamName: string | null = null;
 	private consumerName: string;
 	private lastTimeoutCheck: number = 0;
-	private TIMEOUT_CHECK_INTERVAL: number = 10 * 1000;
 
 	constructor() {
 		this.consumerName = process.env.CONSUMER_NAME || `consumer-${process.pid}`;
@@ -163,11 +162,10 @@ class RedisStreamManager {
 	) {
 		const {
 			count = 1,
-			blockTime = 1000,
-			processingTimeout = 30000,
+			blockTime = 1 * 1000,
+			processingTimeout = 3 * 1000,
 			timeoutHandler,
-			// timeoutCheckInterval = 15000,
-			timeoutCheckInterval = 5000,
+			timeoutCheckInterval = 5 * 1000,
 		} = options;
 
 		console.log(
