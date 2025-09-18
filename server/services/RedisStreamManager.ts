@@ -1,5 +1,7 @@
 import Redis from 'ioredis';
 import { parseRedisFields } from '../utils /parseRedisFields';
+import { EventEmitterFactory } from './EventEmitterFactory';
+import { StreamEvents } from './StreamEvents';
 
 interface RedisConfig {
 	host?: string;
@@ -16,11 +18,7 @@ interface StreamOptions {
 	approximate?: boolean;
 }
 
-type MessageHandler = (
-	data: any,
-	messageId: string,
-	streamName: string
-) => Promise<void>;
+type MessageHandler = (data: any, streamName: string) => Promise<void>;
 
 export interface RedisMessage {
 	[key: string]: any;
@@ -59,74 +57,19 @@ class RedisStreamManager {
 	private streamName: string | null = null;
 	private consumerName: string;
 	private lastTimeoutCheck: number = 0;
+	private streamEventEmitter: StreamEvents;
 
-	constructor() {
+	constructor(
+		eventEmitterFactory: EventEmitterFactory,
+		redisInstanceForStreams: Redis
+	) {
+		this.redis = redisInstanceForStreams;
 		this.consumerName = process.env.CONSUMER_NAME || `consumer-${process.pid}`;
-	}
-
-	/**
-	 * Initialize connection and set stream name
-	 * @param streamName - Name of the Redis stream
-	 * @param redisConfig - Redis connection configuration
-	 */
-	public async initialize(
-		streamName: string,
-		redisConfig: RedisConfig = {}
-	): Promise<RedisStreamManager> {
-		if (this.isConnected && this.streamName === streamName) {
-			return this;
-		}
-
-		this.streamName = streamName;
-
-		// Default Redis configuration
-		const defaultConfig: RedisConfig = {
-			host: 'localhost',
-			port: 6379,
-			retryDelayOnFailover: 100,
-			maxRetriesPerRequest: 3,
-			...redisConfig,
-		};
-
-		try {
-			if (this.redis) {
-				console.log('a redis instance is already exist quitting...');
-				await this.redis.quit();
-			}
-
-			this.redis = new Redis(defaultConfig);
-
-			// Wait for connection
-			await new Promise<void>((resolve, reject) => {
-				this.redis!.on('connecting', () => {
-					console.log(`Connecting to Redis for stream: ${this.streamName}`);
-				});
-
-				this.redis!.on('ready', () => {
-					this.isConnected = true;
-					console.log(`Redis ready for stream: ${this.streamName}`);
-					resolve();
-				});
-
-				this.redis!.on('error', (err) => {
-					this.isConnected = false;
-					console.error('Redis connection error:', err);
-					reject(err);
-				});
-			});
-			await this.redis!.ping();
-
-			return this;
-		} catch (error) {
-			if (this.redis) {
-				await this.redis.quit().catch(() => {});
-				this.redis = null;
-			}
-			this.isConnected = false;
-			throw new Error(
-				`Failed to initialize Redis stream manager: ${(error as Error).message}`
-			);
-		}
+		this.streamEventEmitter = eventEmitterFactory.createOrGetStreamEvents(
+			'streamEvents',
+			30 * 1000
+		);
+		this.isConnected = true;
 	}
 
 	/**
@@ -161,7 +104,7 @@ class RedisStreamManager {
 		options: ConsumerOptions = {}
 	) {
 		const {
-			count = 1,
+			count = 50,
 			blockTime = 1 * 1000,
 			processingTimeout = 3 * 1000,
 			timeoutHandler,
@@ -197,12 +140,15 @@ class RedisStreamManager {
 
 			const messages: StreamReadResult[] | null = rawMessages
 				? (rawMessages as [string, [string, string[]][]][]).map(
-						([streamName, msgs]) => ({
-							streamName,
-							messages: msgs.map(([messageId, fields]) => {
-								return { messageId, message: parseRedisFields(fields) };
-							}),
-						})
+						([streamName, msgs]) => {
+							console.log('rawMessages', msgs);
+							return {
+								streamName,
+								messages: msgs.map(([messageId, fields]) => {
+									return { messageId, message: parseRedisFields(fields) };
+								}),
+							};
+						}
 					)
 				: null;
 
@@ -211,14 +157,33 @@ class RedisStreamManager {
 
 				// Read new messages
 				if (messages && messages.length > 0) {
+					console.log('messages', messages);
+
 					for (const item of messages) {
 						const streamName = item.streamName;
+						console.log('items inside of the messages:', item);
 
 						for (const message of item.messages) {
-							const messageId = message.messageId;
-							const data = message.message;
-							await messageHandler(data, messageId, streamName);
-							await this.redis!.xack(stream, group, messageId);
+							const redisMessageId = message.messageId;
+							const { data } = message.message;
+
+							const datawithRedisMessageId = {
+								...(data as any).messageData,
+								redisMessageId,
+							};
+
+							await messageHandler(datawithRedisMessageId, streamName);
+
+							this.streamEventEmitter.onPersistedPackages(
+								(persistedMessageIds) => {
+									console.log('persistedMessageIds', persistedMessageIds);
+									console.log('stream', stream);
+
+									for (const messageId of persistedMessageIds) {
+										this.redis?.xack(stream, group, messageId);
+									}
+								}
+							);
 						}
 					}
 				}

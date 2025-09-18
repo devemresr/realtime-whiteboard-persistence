@@ -15,6 +15,7 @@ export interface RoomDataBase {
 	isLastPackage?: boolean;
 	strokeSequenceNumber: number;
 	packageId: string;
+	redisMessageId: string;
 }
 
 // Document interface that extends both base and Document
@@ -38,6 +39,7 @@ const RoomDataSchema = new Schema<RoomData>(
 		isLastPackage: { type: Boolean, required: false },
 		strokeSequenceNumber: { type: Number, required: true },
 		packageId: { type: String, required: true },
+		redisMessageId: { type: String, required: false },
 	},
 	{ timestamps: true }
 );

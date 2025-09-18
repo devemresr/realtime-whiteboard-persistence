@@ -1,5 +1,4 @@
 import { Redis } from 'ioredis';
-import RedisService from './RedisService';
 import { getActiveServers } from '../scripts/redis/getActiveServersScript';
 import heartbeatScript from '../scripts/redis/heartbeatScript';
 import { parseRedisFields } from '../utils /parseRedisFields';
@@ -49,8 +48,8 @@ class HeartbeatService {
 	private DATA_KEY: string;
 	private isStarted: boolean = false;
 
-	private constructor(config: config) {
-		this.redis = RedisService.getInstance().getClient();
+	private constructor(config: config, redisInstanceForCache: Redis) {
+		this.redis = redisInstanceForCache;
 		this.port = config.port;
 		this.serverId = config.serverId || `server-${config.port}`;
 		this.serverStartupTime = Date.now();
@@ -61,7 +60,10 @@ class HeartbeatService {
 		this.sendHeartbeat = this.sendHeartbeat.bind(this);
 	}
 
-	static getInstance(config?: config): HeartbeatService {
+	static getInstance(
+		redisInstanceForCache: Redis,
+		config?: config
+	): HeartbeatService {
 		console.log('the config in heartbeatInstance', config);
 
 		if (!HeartbeatService.instance) {
@@ -70,7 +72,10 @@ class HeartbeatService {
 					'HeartbeatService must be initialized with config on first call'
 				);
 			}
-			HeartbeatService.instance = new HeartbeatService(config);
+			HeartbeatService.instance = new HeartbeatService(
+				config,
+				redisInstanceForCache
+			);
 		}
 		return HeartbeatService.instance;
 	}

@@ -7,9 +7,9 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import path from 'path';
 import * as dotenv from 'dotenv';
-import PersistenceController from './controllers/persistenceController';
-import Redis from 'ioredis';
 import HeartbeatService from './services/HeartbeatService';
+import { bootstrapApplication } from './bootstrap';
+import { RedisFactory } from './services/RedisFactory';
 const __dirname = path.dirname(process.argv[1]);
 const envPath = path.resolve(__dirname, '../.env');
 dotenv.config({ path: envPath });
@@ -28,10 +28,8 @@ async function startServer() {
 	try {
 		console.log('port ', PORT);
 
-		const heartbeatInstance = HeartbeatService.getInstance({ port: PORT });
-		const persistenceController = new PersistenceController(PORT);
-		await persistenceController.initialize();
-		console.log('persistence server initialized');
+		const bootstap = await bootstrapApplication(PORT);
+		const { heartbeatInstance } = bootstap;
 
 		// Connect to MongoDB
 		const mongoUri = process.env.MONGODB_URI;
@@ -65,10 +63,21 @@ async function startServer() {
 // Graceful shutdown
 process.on('SIGINT', async () => {
 	try {
+		const redisInstanceForCache = await RedisFactory.createClient(
+			{ port: 6380 },
+			'redisForCache'
+		);
+		await redisInstanceForCache.connect();
+		redisInstanceForCache.on('error', (err) =>
+			console.error('redisInstanceForCache', err)
+		);
 		console.log('Shutting down gracefully...');
 
 		// Remove heartbeat on shutdown and quit redis
-		const heartbeatInstance = HeartbeatService.getInstance({ port: PORT });
+		const heartbeatInstance = HeartbeatService.getInstance(
+			redisInstanceForCache.getClient(),
+			{ port: PORT }
+		);
 		await heartbeatInstance.stop();
 
 		// Close HTTP server

@@ -1,18 +1,24 @@
 import Redis from 'ioredis';
 import RedisStreamManager from '../services/RedisStreamManager';
-import { REDIS_STREAM_EVENTS } from '../shared/constants/socketIoConstants';
+import { REDIS_STREAM_NAMES } from '../shared/constants/socketIoConstants';
 import RoomData, { RoomDataBase } from '../schemas/Strokes';
 import addToTheRoomAndCheckThreshold from '../scripts/redis/addToTheRoomAndCheckThresholdScript';
 import getRoomBatchDataScript from '../scripts/redis/getRoomBatchDataScript';
 import cleanupProcessedStrokesScript from '../scripts/redis/cleanupProcessedStrokesScript';
 import stableHashNumeric from '../utils /stableHash';
 import checkAndDetermineTimeout from '../scripts/redis/checkAndDetermineTimeoutScript';
-import RedisService from '../services/RedisService';
 import HeartbeatService from '../services/HeartbeatService';
+import { StreamEvents } from '../services/StreamEvents';
+import { EventEmitterFactory } from '../services/EventEmitterFactory';
 
 interface BatchProcessingConfig {
 	strokeCountThreshold: number;
 	timeoutMs: number;
+	consumerGroup: string;
+}
+interface BatchProcessingInput {
+	strokeCountThreshold?: number;
+	timeoutMs?: number;
 	consumerGroup: string;
 }
 
@@ -22,24 +28,35 @@ interface RoomBatchData {
 	isTimedOut: boolean;
 }
 
-class DrawingPersistenceManager {
-	private readonly streamManager: RedisStreamManager;
-	public redis: Redis;
+class PersistenceController {
 	private readonly config: BatchProcessingConfig;
 	private isInitialized = false;
-	private heartBeatServiceInstance: HeartbeatService;
+	private heartBeatService: HeartbeatService;
 	private PORT;
+	private streamEventEmitter: StreamEvents;
+	private redis: Redis;
+	private redisStreamManager: RedisStreamManager;
 
-	constructor(PORT: string, config?: Partial<BatchProcessingConfig>) {
-		this.streamManager = new RedisStreamManager();
-		this.redis = RedisService.getInstance().getClient();
+	constructor(
+		PORT: string,
+		eventEmitterFactory: EventEmitterFactory,
+		config: BatchProcessingInput,
+		redisStreamManager: RedisStreamManager,
+		heartBeatService: HeartbeatService,
+		redis: Redis
+	) {
+		this.redis = redis;
+		this.redisStreamManager = redisStreamManager;
 		this.PORT = PORT;
-		this.heartBeatServiceInstance = HeartbeatService.getInstance();
+		this.heartBeatService = heartBeatService;
+		this.streamEventEmitter = eventEmitterFactory.createOrGetStreamEvents(
+			'streamEvents',
+			30 * 1000
+		);
 
 		this.config = {
 			strokeCountThreshold: 100,
 			timeoutMs: 3 * 1000, // after timeout runs out and if it didnt hit to threshold amount we batchwrite it
-			consumerGroup: 'processingServersTest',
 			...config,
 		};
 	}
@@ -48,11 +65,10 @@ class DrawingPersistenceManager {
 		if (this.isInitialized) return;
 
 		try {
-			await this.initializeRedisStreams();
 			console.log('Redis streams initialized');
 
-			this.streamManager.consumeFromGroup(
-				REDIS_STREAM_EVENTS.DRAWING_EVENT,
+			this.redisStreamManager.consumeFromGroup(
+				REDIS_STREAM_NAMES.DRAWING_EVENT,
 				this.config.consumerGroup,
 				this.handleDrawingEvent.bind(this),
 				{ timeoutHandler: this.processTimedOutRooms.bind(this) }
@@ -70,10 +86,13 @@ class DrawingPersistenceManager {
 
 	private async handleDrawingEvent(data: any): Promise<void> {
 		try {
-			const { messageData } = data.data;
-			const roomId = messageData.roomId;
+			if (!this.isInitialized) {
+				console.error('the PersistenceController hasnt been initialized yet');
+				return;
+			}
+			const roomId = data.roomId;
 
-			await this.addStrokeToRoom(roomId, messageData);
+			await this.addStrokeToRoom(roomId, data);
 		} catch (error) {
 			console.error('Error handling drawing event:', error);
 			throw error;
@@ -125,6 +144,8 @@ class DrawingPersistenceManager {
 
 	private async processTimedOutRooms() {
 		try {
+			if (!this.isInitialized)
+				return 'the PersistenceController hasnt been initialized yet';
 			const activeRoomIds = await this.getActiveRoomIds();
 			console.log('activeRoomIds', activeRoomIds);
 
@@ -211,8 +232,27 @@ class DrawingPersistenceManager {
 				);
 
 				// Execute empty transaction to detect changes
+				console.log(
+					'before ',
+					await this.redis.zrangebyscore(
+						'active_servers_ordered',
+						'-inf',
+						'+inf'
+					)
+				);
+
+				// await this.redis.zremrangebyrank('active_servers_ordered', 1, 1);
 				const multi = this.redis.multi();
 				const result = await multi.exec();
+				// console.log('result', result);
+				// console.log(
+				// 	'after ',
+				// 	await this.redis.zrangebyscore(
+				// 		'active_servers_ordered',
+				// 		'-inf',
+				// 		'+inf'
+				// 	)
+				// );
 
 				if (result === null) {
 					// Server list changed - our calculations are invalid, retry
@@ -221,7 +261,11 @@ class DrawingPersistenceManager {
 				}
 
 				// Server topology didn't change try to acquire lock
-				await this.acquireLock(roomId);
+				const lockAcquired = await this.acquireLock(roomId);
+				if (!lockAcquired) {
+					return; // Exit cleanly - another server is handling it
+				}
+
 				return;
 			} catch (error) {
 				console.error(
@@ -255,7 +299,7 @@ class DrawingPersistenceManager {
 			console.log(
 				`Room ${roomId} is already being processed by another instance`
 			);
-			return; // Another process is handling this room
+			return false; // Another process is handling this room
 		}
 
 		// Process batch write asynchronously
@@ -264,6 +308,7 @@ class DrawingPersistenceManager {
 				console.error(`Batch write failed for room ${roomId}:`, error);
 			}
 		);
+		return true;
 	}
 
 	// ========== Batch Processing ==========
@@ -275,6 +320,8 @@ class DrawingPersistenceManager {
 		try {
 			// get the roomData via lua script
 			const raw = await this.getRoomBatchData(roomId);
+			console.log('raw', raw);
+
 			const batchData: RoomBatchData = {
 				strokeCount: raw.strokeCount,
 				strokesData: raw.strokesData,
@@ -303,7 +350,7 @@ class DrawingPersistenceManager {
 		lockKey: string,
 		lockValue: string
 	): Promise<void> {
-		const luaScript = `
+		const releaseLockIfOwnedScript = `
 		if redis.call("GET", KEYS[1]) == ARGV[1] then
 			return redis.call("DEL", KEYS[1])
 		else
@@ -311,7 +358,7 @@ class DrawingPersistenceManager {
 		end
 	`;
 		try {
-			await this.redis.eval(luaScript, 1, lockKey, lockValue);
+			await this.redis.eval(releaseLockIfOwnedScript, 1, lockKey, lockValue);
 		} catch (error) {
 			console.error('Failed to release lock:', error);
 		}
@@ -370,6 +417,7 @@ class DrawingPersistenceManager {
 				matchedCount: result.matchedCount,
 				modifiedCount: result.modifiedCount,
 				upsertedCount: result.upsertedCount,
+				result,
 			});
 
 			// Handle partial failures
@@ -448,6 +496,9 @@ class DrawingPersistenceManager {
 			const strokeJsonStrings = processedStrokes.map((stroke) =>
 				JSON.stringify(stroke)
 			);
+
+			console.log('processedStrokes', processedStrokes);
+
 			const args = [
 				processedStrokes.length.toString(),
 				Date.now().toString(),
@@ -471,6 +522,12 @@ class DrawingPersistenceManager {
 				newCount,
 			});
 
+			const persistedMessageIds = processedStrokes.map((i) => {
+				return i.redisMessageId;
+			});
+
+			this.streamEventEmitter.emitPersistedPackages(persistedMessageIds);
+
 			// Remove room from active rooms if no strokes left
 			if (newCount === 0) {
 				await this.removeFromActiveRooms(roomId);
@@ -483,6 +540,8 @@ class DrawingPersistenceManager {
 			throw error;
 		}
 	}
+
+	private cleanup() {}
 
 	// ========== Redis Helper Methods ==========
 
@@ -503,18 +562,8 @@ class DrawingPersistenceManager {
 	}
 
 	private async getActiveServers() {
-		return await this.heartBeatServiceInstance.getActiveServers();
-	}
-
-	// ========== Stream Initialization ==========
-	private async initializeRedisStreams(): Promise<void> {
-		try {
-			await this.streamManager.initialize(REDIS_STREAM_EVENTS.DRAWING_EVENT);
-		} catch (error) {
-			console.error('Failed to initialize Redis streams:', error);
-			throw error;
-		}
+		return await this.heartBeatService.getActiveServers();
 	}
 }
 
-export default DrawingPersistenceManager;
+export default PersistenceController;
