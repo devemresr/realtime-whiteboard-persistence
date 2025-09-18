@@ -1,8 +1,8 @@
 import PersistenceController from './controllers/persistenceController';
-import { EventEmitterFactory } from './services/EventEmitterFactory';
-import HeartbeatService from './services/HeartbeatService';
-import { RedisFactory } from './services/RedisFactory';
-import RedisStreamManager from './services/RedisStreamManager';
+import { EventEmitterFactory } from './events/EventEmitterFactory';
+import HeartbeatService from './services/heartbeat/HeartbeatService';
+import { RedisFactory } from './services/redis/RedisFactory';
+import RedisStreamManager from './services/redis/RedisStreamManager';
 import { REDIS_STREAM_NAMES } from './shared/constants/socketIoConstants';
 
 export async function bootstrapApplication(port: string): Promise<any> {

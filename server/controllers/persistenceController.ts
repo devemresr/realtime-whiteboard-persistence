@@ -1,5 +1,5 @@
 import Redis from 'ioredis';
-import RedisStreamManager from '../services/RedisStreamManager';
+import RedisStreamManager from '../services/redis/RedisStreamManager';
 import { REDIS_STREAM_NAMES } from '../shared/constants/socketIoConstants';
 import RoomData, { RoomDataBase } from '../schemas/Strokes';
 import addToTheRoomAndCheckThreshold from '../scripts/redis/addToTheRoomAndCheckThresholdScript';
@@ -7,9 +7,9 @@ import getRoomBatchDataScript from '../scripts/redis/getRoomBatchDataScript';
 import cleanupProcessedStrokesScript from '../scripts/redis/cleanupProcessedStrokesScript';
 import stableHashNumeric from '../utils /stableHash';
 import checkAndDetermineTimeout from '../scripts/redis/checkAndDetermineTimeoutScript';
-import HeartbeatService from '../services/HeartbeatService';
-import { StreamEvents } from '../services/StreamEvents';
-import { EventEmitterFactory } from '../services/EventEmitterFactory';
+import HeartbeatService from '../services/heartbeat/HeartbeatService';
+import { StreamEvents } from '../events/StreamEvents';
+import { EventEmitterFactory } from '../events/EventEmitterFactory';
 
 interface BatchProcessingConfig {
 	strokeCountThreshold: number;

@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { parseRedisFields } from '../utils /parseRedisFields';
-import { EventEmitterFactory } from './EventEmitterFactory';
-import { StreamEvents } from './StreamEvents';
+import { parseRedisFields } from '../../utils /parseRedisFields';
+import { EventEmitterFactory } from '../../events/EventEmitterFactory';
+import { StreamEvents } from '../../events/StreamEvents';
 
 interface RedisConfig {
 	host?: string;

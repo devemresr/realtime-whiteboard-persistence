@@ -1,4 +1,4 @@
-import { RedisMessage } from '../services/RedisStreamManager';
+import { RedisMessage } from '../services/redis/RedisStreamManager';
 
 /**
  * Safely parse a JSON string, returning the original value if parsing fails

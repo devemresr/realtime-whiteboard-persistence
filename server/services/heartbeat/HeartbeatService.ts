@@ -1,7 +1,7 @@
 import { Redis } from 'ioredis';
-import { getActiveServers } from '../scripts/redis/getActiveServersScript';
-import heartbeatScript from '../scripts/redis/heartbeatScript';
-import { parseRedisFields } from '../utils /parseRedisFields';
+import { getActiveServers } from '../../scripts/redis/getActiveServersScript';
+import heartbeatScript from '../../scripts/redis/heartbeatScript';
+import { parseRedisFields } from '../../utils /parseRedisFields';
 
 export interface ServerInfo {
 	id: string;
