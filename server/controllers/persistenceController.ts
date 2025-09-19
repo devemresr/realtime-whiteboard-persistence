@@ -1,6 +1,6 @@
 import Redis from 'ioredis';
 import RedisStreamManager from '../services/redis/RedisStreamManager';
-import { REDIS_STREAM_NAMES } from '../shared/constants/socketIoConstants';
+import { REDIS_STREAMS } from '../constants/RedisConstants';
 import RoomData, { RoomDataBase } from '../schemas/Strokes';
 import addToTheRoomAndCheckThreshold from '../scripts/redis/addToTheRoomAndCheckThresholdScript';
 import getRoomBatchDataScript from '../scripts/redis/getRoomBatchDataScript';
@@ -68,7 +68,7 @@ class PersistenceController {
 			console.log('Redis streams initialized');
 
 			this.redisStreamManager.consumeFromGroup(
-				REDIS_STREAM_NAMES.DRAWING_EVENT,
+				REDIS_STREAMS.DRAWING_EVENTS,
 				this.config.consumerGroup,
 				this.handleDrawingEvent.bind(this),
 				{ timeoutHandler: this.processTimedOutRooms.bind(this) }

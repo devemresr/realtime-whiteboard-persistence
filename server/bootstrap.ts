@@ -3,7 +3,11 @@ import { EventEmitterFactory } from './events/EventEmitterFactory';
 import HeartbeatService from './services/heartbeat/HeartbeatService';
 import { RedisFactory } from './services/redis/RedisFactory';
 import RedisStreamManager from './services/redis/RedisStreamManager';
-import { REDIS_STREAM_NAMES } from './shared/constants/socketIoConstants';
+import {
+	REDIS_CLIENTS,
+	REDIS_CONSUMER_GROUPS,
+	REDIS_STREAMS,
+} from './constants/RedisConstants';
 
 export async function bootstrapApplication(port: string): Promise<any> {
 	try {
@@ -16,7 +20,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 		// Create redis intances
 		const redisInstanceForStreams = await RedisFactory.createClient(
 			{ port: 6379 },
-			'redisForStreams'
+			REDIS_CLIENTS.STREAM
 		);
 		await redisInstanceForStreams.connect();
 		redisInstanceForStreams.on('error', (err) =>
@@ -25,7 +29,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 
 		const redisInstanceForCache = await RedisFactory.createClient(
 			{ port: 6380 },
-			'redisForCache'
+			REDIS_CLIENTS.CACHE
 		);
 		await redisInstanceForCache.connect();
 		redisInstanceForCache.on('error', (err) =>
@@ -38,8 +42,8 @@ export async function bootstrapApplication(port: string): Promise<any> {
 			redisInstanceForStreams.getClient()
 		);
 		await redisStreamManager.createConsumerGroup(
-			REDIS_STREAM_NAMES.DRAWING_EVENT,
-			'processingServersTest'
+			REDIS_STREAMS.DRAWING_EVENTS,
+			REDIS_CONSUMER_GROUPS.PERSISTENCE
 		);
 		console.log('RedisStreamManager initialized');
 
@@ -53,7 +57,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 		const persistenceController = new PersistenceController(
 			port,
 			eventEmitterFactory,
-			{ consumerGroup: 'processingServersTest' },
+			{ consumerGroup: REDIS_CONSUMER_GROUPS.PERSISTENCE },
 			redisStreamManager,
 			heartbeatInstance,
 			redisInstanceForStreams.getClient()
