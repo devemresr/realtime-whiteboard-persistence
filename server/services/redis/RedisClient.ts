@@ -5,9 +5,10 @@ export class RedisClient extends EventEmitter {
 	private client: Redis;
 	private config: RedisOptions;
 	private isConnected = false;
+	private redisClientName: String;
 	private connectionPromise: Promise<void> | null = null;
 
-	constructor(config?: RedisOptions) {
+	constructor(config?: RedisOptions, redisClientName?: String) {
 		super();
 
 		this.config = {
@@ -17,50 +18,63 @@ export class RedisClient extends EventEmitter {
 			connectTimeout: 10000,
 			keepAlive: 30000,
 			enableReadyCheck: true,
+			lazyConnect: true,
+			retryStrategy: (times) => {
+				if (times > 10) {
+					console.error('Redis connection failed after 10 retry attempts');
+					return null; // Stop retrying
+				}
+				const delay = Math.min(times * 50, 500);
+				console.log(
+					`Redis retrying connection in ${delay}ms (attempt ${times})`
+				);
+				return delay; // Exponential backoff, max 500ms
+			},
 			...config,
 		};
 
+		this.redisClientName = redisClientName || `redis-${Date.now()}`;
 		this.client = new Redis(this.config);
 		this.setupEventHandlers();
 	}
 
 	private setupEventHandlers(): void {
 		this.client.on('connecting', () => {
-			console.log('Connecting to Redis...');
+			console.log(`[${this.redisClientName}] Connecting to Redis...`);
 			this.emit('connecting');
 		});
 
 		this.client.on('connect', () => {
-			console.log('Connected to Redis');
+			console.log(`[${this.redisClientName}] Connected to Redis...`);
 			this.emit('connect');
 		});
 
 		this.client.on('ready', () => {
 			this.isConnected = true;
-			console.log('Redis ready');
+			console.log(`[${this.redisClientName}] Redis ready`);
 			this.emit('ready');
 		});
 
 		this.client.on('error', (err) => {
 			this.isConnected = false;
-			console.error('Redis connection error:', err);
+			console.error(`[${this.redisClientName}] Redis connection error:`, err);
 			this.emit('error', err);
 		});
 
 		this.client.on('close', () => {
 			this.isConnected = false;
-			console.log('Redis connection closed');
+			console.log(`[${this.redisClientName}] Redis connection closed`);
 			this.emit('close');
 		});
 
 		this.client.on('reconnecting', () => {
-			console.log('Redis reconnecting...');
+			console.log(`[${this.redisClientName}] Redis reconnecting...`);
 			this.emit('reconnecting');
 		});
 
 		this.client.on('end', () => {
 			this.isConnected = false;
-			console.log('Redis connection ended');
+			console.log(`[${this.redisClientName}] Redis connection ended`);
 			this.emit('end');
 		});
 	}
@@ -94,10 +108,13 @@ export class RedisClient extends EventEmitter {
 			this.once('ready', onReady);
 			this.once('error', onError);
 
-			if (this.isConnected) {
-				cleanup();
-				resolve();
-			}
+			this.client.connect().catch((err) => {
+				console.error(
+					`[${this.redisClientName}] client.connect() threw error:`,
+					err
+				);
+				onError(err);
+			});
 		});
 
 		return this.connectionPromise;

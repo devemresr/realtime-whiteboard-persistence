@@ -9,7 +9,6 @@ import stableHashNumeric from '../utils /stableHash';
 import checkAndDetermineTimeout from '../scripts/redis/checkAndDetermineTimeoutScript';
 import HeartbeatService from '../services/heartbeat/HeartbeatService';
 import { StreamEvents } from '../events/StreamEvents';
-import { EventEmitterFactory } from '../events/EventEmitterFactory';
 
 interface BatchProcessingConfig {
 	strokeCountThreshold: number;
@@ -39,20 +38,17 @@ class PersistenceController {
 
 	constructor(
 		PORT: string,
-		eventEmitterFactory: EventEmitterFactory,
+		streamEventEmitter: StreamEvents,
 		config: BatchProcessingInput,
 		redisStreamManager: RedisStreamManager,
 		heartBeatService: HeartbeatService,
 		redis: Redis
 	) {
 		this.redis = redis;
+		this.streamEventEmitter = streamEventEmitter;
 		this.redisStreamManager = redisStreamManager;
 		this.PORT = PORT;
 		this.heartBeatService = heartBeatService;
-		this.streamEventEmitter = eventEmitterFactory.createOrGetStreamEvents(
-			'streamEvents',
-			30 * 1000
-		);
 
 		this.config = {
 			strokeCountThreshold: 100,
@@ -120,6 +116,8 @@ class PersistenceController {
 				now.toString(),
 				this.config.strokeCountThreshold
 			)) as [number, number];
+
+			console.log('strokeData', strokeData);
 
 			const shouldTriggerBatchWrite = shouldTriggerBatchWriteResult[1];
 			const strokeCount = shouldTriggerBatchWriteResult[0];
@@ -199,10 +197,10 @@ class PersistenceController {
 				// Check if we're responsible (outside transaction)
 				const isResponsible = await this.isMyRoom(roomId);
 				if (!isResponsible) {
-					console.log('isnt responsible for the room: ', roomId);
 					await this.redis.unwatch();
 					return;
 				}
+
 				console.log('serverId', this.PORT, 'isResponsible for:', roomId);
 				const roomKey = this.getRoomKey(roomId);
 				const strokesKey = this.getRoomStrokesKey(roomId);
@@ -303,6 +301,8 @@ class PersistenceController {
 		}
 
 		// Process batch write asynchronously
+		// Batch operations are scoped to a single room to maintain data consistency
+		// and simplify cleanup - both write batching and cleanup logic expect one roomId
 		this.processBatchWriteWithLock(roomId, lockKey, lockValue).catch(
 			(error: any) => {
 				console.error(`Batch write failed for room ${roomId}:`, error);
@@ -320,7 +320,6 @@ class PersistenceController {
 		try {
 			// get the roomData via lua script
 			const raw = await this.getRoomBatchData(roomId);
-			console.log('raw', raw);
 
 			const batchData: RoomBatchData = {
 				strokeCount: raw.strokeCount,
@@ -522,11 +521,13 @@ class PersistenceController {
 				newCount,
 			});
 
-			const persistedMessageIds = processedStrokes.map((i) => {
-				return i.redisMessageId;
-			});
+			const redisMessageIds = processedStrokes.map((i) => i.redisMessageId);
 
-			this.streamEventEmitter.emitPersistedPackages(persistedMessageIds);
+			// All operations were done by roomId so one roomId is enough
+			this.streamEventEmitter.emitPersistedPackages({
+				redisMessageIds,
+				roomId,
+			});
 
 			// Remove room from active rooms if no strokes left
 			if (newCount === 0) {

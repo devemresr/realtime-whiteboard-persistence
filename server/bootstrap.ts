@@ -8,6 +8,7 @@ import {
 	REDIS_CONSUMER_GROUPS,
 	REDIS_STREAMS,
 } from './constants/RedisConstants';
+import { STREAM_EVENTS } from './constants/streamEventEmitterConstants';
 
 export async function bootstrapApplication(port: string): Promise<any> {
 	try {
@@ -16,13 +17,16 @@ export async function bootstrapApplication(port: string): Promise<any> {
 		// Create eventEmitter dependency
 		const eventEmitterFactory = new EventEmitterFactory();
 		console.log('EventEmitterFactory created');
+		const streamEventEmitter = eventEmitterFactory.createOrGetStreamEvents(
+			STREAM_EVENTS,
+			3 * 1000
+		);
 
 		// Create redis intances
 		const redisInstanceForStreams = await RedisFactory.createClient(
 			{ port: 6379 },
 			REDIS_CLIENTS.STREAM
 		);
-		await redisInstanceForStreams.connect();
 		redisInstanceForStreams.on('error', (err) =>
 			console.error('redisInstanceForStreams', err)
 		);
@@ -31,14 +35,13 @@ export async function bootstrapApplication(port: string): Promise<any> {
 			{ port: 6380 },
 			REDIS_CLIENTS.CACHE
 		);
-		await redisInstanceForCache.connect();
 		redisInstanceForCache.on('error', (err) =>
 			console.error('redisInstanceForCache', err)
 		);
 
 		// Create and initialize Redis stream manager
 		const redisStreamManager = new RedisStreamManager(
-			eventEmitterFactory,
+			streamEventEmitter,
 			redisInstanceForStreams.getClient()
 		);
 		await redisStreamManager.createConsumerGroup(
@@ -56,7 +59,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 		// Create persistence controller with explicit dependencies
 		const persistenceController = new PersistenceController(
 			port,
-			eventEmitterFactory,
+			streamEventEmitter,
 			{ consumerGroup: REDIS_CONSUMER_GROUPS.PERSISTENCE },
 			redisStreamManager,
 			heartbeatInstance,
@@ -68,7 +71,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 
 		return {
 			persistenceController,
-			eventEmitterFactory,
+			streamEventEmitter,
 			redisStreamManager,
 			redisInstanceForCache,
 			heartbeatInstance,

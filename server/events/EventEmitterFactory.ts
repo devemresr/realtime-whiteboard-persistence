@@ -10,19 +10,9 @@ class EventEmitterFactory {
 		idleTimeout: number
 	): StreamEvents {
 		if (!this.streamInstances.has(instanceKey)) {
-			console.log('instanceKey', instanceKey, 'doesnt exist setting it up');
-
 			this.streamInstances.set(
 				instanceKey,
 				new StreamEvents(instanceKey, idleTimeout)
-			);
-			console.log('streamInstances', this.streamInstances);
-		} else {
-			console.log(
-				'instanceKey',
-				instanceKey,
-				' EXIST returning:',
-				this.streamInstances.get(instanceKey)
 			);
 		}
 

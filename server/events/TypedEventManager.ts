@@ -22,6 +22,13 @@ abstract class TypedEventManager<
 	public emitEvent<K extends keyof T>(event: K, ...args: T[K]) {
 		this.emit(event as string, ...args);
 	}
+
+	public removeEventListener<K extends keyof T>(
+		event: K,
+		listener: (...args: T[K]) => void
+	) {
+		this.off(event as string | symbol, listener);
+	}
 }
 
 export { TypedEventManager };
