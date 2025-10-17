@@ -1,7 +1,7 @@
 import { Redis } from 'ioredis';
 import { getActiveServers } from '../../scripts/redis/getActiveServersScript';
 import heartbeatScript from '../../scripts/redis/heartbeatScript';
-import { parseRedisFields } from '../../utils /parseRedisFields';
+import { parseRedisFields } from '../../utils/parseRedisFields';
 
 export interface ServerInfo {
 	id: string;
@@ -29,8 +29,6 @@ interface config {
 	serverId?: string;
 	HEARTBEAT_INTERVAL_MS?: number;
 	SERVER_TIMEOUT_SECONDS?: number;
-	ORDERED_KEY?: string;
-	DATA_KEY?: string;
 }
 
 class HeartbeatService {
@@ -44,25 +42,31 @@ class HeartbeatService {
 
 	private HEARTBEAT_INTERVAL_MS: number;
 	private SERVER_TIMEOUT_SECONDS: number;
-	private ORDERED_KEY: string;
-	private DATA_KEY: string;
+	private ACTIVE_SERVERS_KEY: string;
+	private ACTIVE_SERVER_DATA: string;
 	private isStarted: boolean = false;
 
 	private constructor(config: config, redisInstanceForCache: Redis) {
 		this.redis = redisInstanceForCache;
 		this.port = config.port;
-		this.serverId = config.serverId || `server-${config.port}`;
+		// Server ID priority: process.env.PORT (if set) → config.port (from CLI flag)
+		// This allows multiple dev instances sharing the same .env to have unique IDs
+		// based on their --port flag. Production should use explicit SERVER_ID env vars.
+		const derivedServerId = process.env.PORT
+			? `server-${process.env.PORT}`
+			: undefined;
+		this.serverId = derivedServerId ?? `server-${config.port}`;
 		this.serverStartupTime = Date.now();
 		this.HEARTBEAT_INTERVAL_MS = config?.HEARTBEAT_INTERVAL_MS ?? 10 * 1000;
 		this.SERVER_TIMEOUT_SECONDS = config?.SERVER_TIMEOUT_SECONDS ?? 10;
-		this.ORDERED_KEY = config?.ORDERED_KEY ?? 'active_servers_ordered';
-		this.DATA_KEY = config?.DATA_KEY ?? 'active_servers_data';
+		this.ACTIVE_SERVERS_KEY = process.env.ACTIVE_SERVERS_KEY!;
+		this.ACTIVE_SERVER_DATA = process.env.ACTIVE_SERVER_DATA!;
 		this.sendHeartbeat = this.sendHeartbeat.bind(this);
 	}
 
 	static getInstance(
 		redisInstanceForCache: Redis,
-		config?: config
+		config: config
 	): HeartbeatService {
 		console.log('the config in heartbeatInstance', config);
 
@@ -102,26 +106,6 @@ class HeartbeatService {
 	}
 
 	/**
-	 * Stop the heartbeat service
-	 */
-	async stop(): Promise<void> {
-		try {
-			// Clear intervals
-			if (this.heartbeatInterval) {
-				clearInterval(this.heartbeatInterval);
-				this.heartbeatInterval = null;
-			}
-
-			// Remove this server from active list
-			await this.removeServer();
-
-			console.log(`Heartbeat service stopped for ${this.serverId}`);
-		} catch (error) {
-			console.error('Failed to stop heartbeat service:', error);
-		}
-	}
-
-	/**
 	 * Send heartbeat to Redis
 	 */
 	private async sendHeartbeat() {
@@ -135,15 +119,18 @@ class HeartbeatService {
 				startupTime: this.serverStartupTime,
 			};
 
+			// Using ZADD to maintain a consistent ordered list of active servers across all instances.
+			// The order is critical because we use a stable hash algorithm that depends on server
+			// position in the list - all servers must see the same order to produce identical results.
 			const rawResults = (await this.redis.eval(
 				heartbeatScript,
 				2,
-				this.ORDERED_KEY,
-				this.DATA_KEY,
+				this.ACTIVE_SERVERS_KEY,
+				this.ACTIVE_SERVER_DATA,
 				this.serverStartupTime.toString(),
-				this.port,
+				this.serverId,
 				JSON.stringify(serverInfo),
-				this.SERVER_TIMEOUT_SECONDS
+				this.SERVER_TIMEOUT_SECONDS // cleanupTime
 			)) as string;
 			const results = JSON.parse(rawResults);
 
@@ -166,8 +153,8 @@ class HeartbeatService {
 			const rawResults = (await this.redis.eval(
 				getActiveServers,
 				2,
-				this.ORDERED_KEY,
-				this.DATA_KEY,
+				this.ACTIVE_SERVERS_KEY,
+				this.ACTIVE_SERVER_DATA,
 				this.SERVER_TIMEOUT_SECONDS
 			)) as string;
 
@@ -186,6 +173,26 @@ class HeartbeatService {
 	}
 
 	/**
+	 * Stop the heartbeat service
+	 */
+	async stop(): Promise<void> {
+		try {
+			// Clear intervals
+			if (this.heartbeatInterval) {
+				clearInterval(this.heartbeatInterval);
+				this.heartbeatInterval = null;
+			}
+
+			// Remove this server from active list
+			await this.removeServer();
+
+			console.log(`Heartbeat service stopped for ${this.serverId}`);
+		} catch (error) {
+			console.error('Failed to stop heartbeat service:', error);
+		}
+	}
+
+	/**
 	 * Remove this server from the active list
 	 */
 	private async removeServer(): Promise<void> {
@@ -199,8 +206,8 @@ class HeartbeatService {
 			await this.redis.eval(
 				removeScript,
 				2,
-				this.ORDERED_KEY,
-				this.DATA_KEY,
+				this.ACTIVE_SERVERS_KEY,
+				this.ACTIVE_SERVER_DATA,
 				this.serverId
 			);
 		} catch (error) {

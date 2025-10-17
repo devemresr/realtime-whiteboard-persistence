@@ -1,7 +1,7 @@
 import Redis from 'ioredis';
-import { parseRedisFields } from '../../utils /parseRedisFields';
+import { parseRedisFields } from '../../utils/parseRedisFields';
 import { persistedMessages, StreamEvents } from '../../events/StreamEvents';
-import { ackMessageRemoveInflightScript } from '../../scripts/redis/ackMessageRemoveInflightScript';
+import { ackMessagesScript } from '../../scripts/redis/ackMessagesScript';
 
 interface RedisConfig {
 	host?: string;
@@ -13,7 +13,7 @@ interface RedisConfig {
 	[key: string]: any;
 }
 
-type MessageHandler = (data: any, streamName: string) => Promise<void>;
+type MessageHandler = (data: any) => Promise<void>;
 
 export interface RedisMessage {
 	[key: string]: any;
@@ -21,6 +21,10 @@ export interface RedisMessage {
 interface RedisStreamMessage {
 	messageId: string;
 	message: Record<string, string>;
+	strokes: any;
+	packageSequenceNumber: any;
+	strokeId: any;
+	roomId: any;
 }
 
 interface StreamReadResult {
@@ -87,30 +91,28 @@ class RedisStreamManager {
 				if (redisMessageIds.length === 0) return;
 				try {
 					// since were emitting the messageIds by each room we dont need to
-					const result = await this.redis
-						?.eval(
-							ackMessageRemoveInflightScript,
-							2,
-							stream,
-							group,
-							JSON.stringify(redisMessageIds),
-							roomId
-						)
-						.then((i) => JSON.parse(i as string));
+					const result = await this.redis!.eval(
+						ackMessagesScript,
+						2,
+						stream,
+						group,
+						JSON.stringify(redisMessageIds)
+					).then((i) => JSON.parse(i as string));
 
-					const { ackResult, inflightRemovedCount, persistedAddedCount } =
-						result;
-					console.log('type: ', typeof result, result);
-
-					console.log(
-						`Acked ${ackResult} messages successfully for the room: ${roomId} also removed messages from the inFlight set: ${inflightRemovedCount} and added to persisted set: ${persistedAddedCount}`
-					);
+					const { ackResult, messageIds } = result;
+					if (ackResult)
+						console.log(
+							'Acked: ',
+							...messageIds,
+							`messages successfully for the room: ${roomId}`
+						);
 				} catch (error) {
 					console.error('Failed to ack messages:', error);
 					//todo handle this error appropriately
 				}
 			}
 		);
+		return;
 	}
 
 	/**
@@ -131,7 +133,7 @@ class RedisStreamManager {
 			blockTime = 1 * 1000,
 			processingTimeout = 3 * 1000,
 			timeoutHandler,
-			timeoutCheckInterval = 5 * 1000,
+			timeoutCheckInterval = 6 * 1000,
 		} = options;
 
 		console.log(
@@ -140,7 +142,7 @@ class RedisStreamManager {
 
 		// One-time setup of persistent Redis XACK event listener
 		// TODO: Refactor to constructor injection when implementing graceful shutdown
-		this.setupEventListener(stream, group);
+		await this.setupEventListener(stream, group);
 
 		while (true) {
 			if (
@@ -152,7 +154,7 @@ class RedisStreamManager {
 				this.lastTimeoutCheck = Date.now();
 			}
 
-			const rawMessages = await this.redis!.xreadgroup(
+			const rawMessages: any = await this.redis!.xreadgroup(
 				'GROUP',
 				group,
 				this.consumerName,
@@ -165,47 +167,41 @@ class RedisStreamManager {
 				'>'
 			);
 
-			console.log('rawMessages', rawMessages);
+			if (rawMessages) console.log('rawMessages', rawMessages);
 
 			const messages: StreamReadResult[] | null = rawMessages
 				? (rawMessages as [string, [string, string[]][]][]).map(
 						([streamName, msgs]) => {
 							return {
 								streamName,
-								messages: msgs.map(([messageId, fields]) => {
-									return { messageId, message: parseRedisFields(fields) };
+								messages: msgs.map(([redisMessageId, fields]) => {
+									return { redisMessageId, ...parseRedisFields(fields) };
 								}),
 							};
 						}
 					)
 				: null;
 
+			if (messages) console.log('messages', messages);
+
 			try {
-				// todo add Read pending messages first (messages that were delivered but not acknowledged)
-
-				// Read new messages
+				const messagesByRoom = new Map<string, Array<any>>();
 				if (messages && messages.length > 0) {
-					console.log('messages', messages);
-
 					for (const item of messages) {
-						const streamName = item.streamName;
-						console.log('items inside of the messages:', item);
-
 						for (const message of item.messages) {
-							const redisMessageId = message.messageId;
-							const { data } = message.message;
-							console.log('data', data);
-
-							const datawithRedisMessageId = {
-								...(data as any),
-								redisMessageId,
-							};
-
-							await messageHandler(datawithRedisMessageId, streamName);
-							console.log('rerunning teh funciton');
+							const { roomId } = message;
+							if (!messagesByRoom.has(roomId)) {
+								messagesByRoom.set(roomId, []);
+							}
+							messagesByRoom.get(roomId)!.push(message);
 						}
 					}
 				}
+				for (const [roomId, roomMessages] of messagesByRoom) {
+					await messageHandler(roomMessages);
+				}
+
+				// todo add Read pending messages first (messages that were delivered but not acknowledged)
 			} catch (error) {
 				console.error('❌ Error in consumer loop:', error);
 				await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait before retrying

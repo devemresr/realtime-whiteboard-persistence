@@ -6,6 +6,7 @@ const heartbeatScript = `
                 local activeServerListName = KEYS[2]
                 local serverStartupTime = tonumber(ARGV[1])
                 local serverId = ARGV[2]
+				local serverStatus = ARGV[3]
 				local cleanupTime = tonumber(ARGV[4])
 				local currentTime = redis.call('TIME')[1]
 				local cutoff = currentTime - (cleanupTime + 1)
@@ -14,7 +15,7 @@ const heartbeatScript = `
 				
 				
 				-- Store full server data in hash
-				redis.call('HSET', activeServerListName, serverId, ARGV[3])
+				redis.call('HSET', activeServerListName, serverId, serverStatus)
 
                 ${getActiveServersWithoutReturn}
 				

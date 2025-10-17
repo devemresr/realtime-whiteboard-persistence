@@ -23,26 +23,18 @@ export async function bootstrapApplication(port: string): Promise<any> {
 		);
 
 		// Create redis intances
-		const redisInstanceForStreams = await RedisFactory.createClient(
+		const redisMain = await RedisFactory.createClient(
 			{ port: 6379 },
-			REDIS_CLIENTS.STREAM
+			REDIS_CLIENTS.MAIN
 		);
-		redisInstanceForStreams.on('error', (err) =>
-			console.error('redisInstanceForStreams', err)
-		);
+		redisMain.on('error', (err) => console.error('redisMain', err));
 
-		const redisInstanceForCache = await RedisFactory.createClient(
-			{ port: 6380 },
-			REDIS_CLIENTS.CACHE
-		);
-		redisInstanceForCache.on('error', (err) =>
-			console.error('redisInstanceForCache', err)
-		);
+		// await redisMain.getClient().flushall();
 
 		// Create and initialize Redis stream manager
 		const redisStreamManager = new RedisStreamManager(
 			streamEventEmitter,
-			redisInstanceForStreams.getClient()
+			redisMain.getClient()
 		);
 		await redisStreamManager.createConsumerGroup(
 			REDIS_STREAMS.DRAWING_EVENTS,
@@ -52,8 +44,10 @@ export async function bootstrapApplication(port: string): Promise<any> {
 
 		// Initialize heartbeat
 		const heartbeatInstance = HeartbeatService.getInstance(
-			redisInstanceForCache.getClient(),
-			{ port }
+			redisMain.getClient(),
+			{
+				port,
+			}
 		);
 
 		// Create persistence controller with explicit dependencies
@@ -63,7 +57,7 @@ export async function bootstrapApplication(port: string): Promise<any> {
 			{ consumerGroup: REDIS_CONSUMER_GROUPS.PERSISTENCE },
 			redisStreamManager,
 			heartbeatInstance,
-			redisInstanceForStreams.getClient()
+			redisMain.getClient()
 		);
 
 		await persistenceController.initialize();
@@ -73,9 +67,8 @@ export async function bootstrapApplication(port: string): Promise<any> {
 			persistenceController,
 			streamEventEmitter,
 			redisStreamManager,
-			redisInstanceForCache,
+			redisMain,
 			heartbeatInstance,
-			redisInstanceForStreams,
 		};
 	} catch (error) {
 		console.log('error at startup:', error);

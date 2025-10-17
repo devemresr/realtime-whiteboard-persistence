@@ -1,44 +1,48 @@
-const addToTheRoomAndCheckThreshold = `
+export const addToTheRoomAndCheckThreshold = `
 -- KEYS[1] = room hash key
--- KEYS[2] = strokes set key
 -- ARGV[1] = roomId
--- ARGV[2] = strokeData (JSON string)
+-- ARGV[2] = data (JSON array string)
 -- ARGV[3] = current timestamp (ms)
 -- ARGV[4] = strokeCountThreshold
+-- ARGV[5] = activeRoomsSetKey
 
-local roomKey = KEYS[1]
-local strokesKey = KEYS[2]
+local inflightHashKey = KEYS[1]
+local inflightMetadataHashKey = KEYS[2]
 local roomId = ARGV[1]
-local strokeData = ARGV[2]
+local data = ARGV[2]
 local now = tonumber(ARGV[3])
 local threshold = tonumber(ARGV[4])
+local activeRoomsSetKey = ARGV[5]
+local parsedData = cjson.decode(data)
 
 -- Check if room exists
-local roomExists = redis.call("EXISTS", roomKey)
+local roomExists = redis.call("EXISTS", inflightMetadataHashKey)
 
 -- If not exists, create initial metadata
 if roomExists == 0 then
-    redis.call("HSET", roomKey,
-        "roomId", roomId,
+    redis.call("HSET", inflightMetadataHashKey,
         "strokeCount", 0,
         "createdAt", now,
         "lastUpdated", now,
         "isTimedOut", "false"
     )
-    redis.call("SADD", "activeRooms", roomId)
-    redis.call("EXPIRE", "activeRooms", 3600) -- 1 hour TTL as fallback
+    redis.call("SADD", activeRoomsSetKey, roomId)
+    redis.call("EXPIRE", activeRoomsSetKey, 3600)
 end
 
--- Increment stroke count & update metadata
-local newCount = redis.call("HINCRBY", roomKey, "strokeCount", 1)
-redis.call("HSET", roomKey, "lastUpdated", now)
+-- Increment stroke count by batch size
+local batchSize = #parsedData
+local newCount = redis.call("HINCRBY", inflightMetadataHashKey, "strokeCount", batchSize)
+redis.call("HSET", inflightMetadataHashKey, "lastUpdated", now)
 
--- Add stroke data to strokes set
-redis.call("SADD", strokesKey, strokeData)
+-- Add each stroke to the hash
+for i, element in ipairs(parsedData) do
+    redis.call('HSET', inflightHashKey, tostring(element.packageId), cjson.encode(element))
+end
 
 -- Ensure activeRooms is kept alive
-redis.call("SADD", "activeRooms", roomId)
-redis.call("EXPIRE", "activeRooms", 3600)
+redis.call("SADD", activeRoomsSetKey, roomId)
+redis.call("EXPIRE", activeRoomsSetKey, 3600)
 
 -- Check threshold
 local shouldTrigger = 0
@@ -46,8 +50,5 @@ if newCount >= threshold then
     shouldTrigger = 1
 end
 
--- return [new stroke count, shouldTrigger flag]
 return { newCount, shouldTrigger }
 `;
-
-export default addToTheRoomAndCheckThreshold;

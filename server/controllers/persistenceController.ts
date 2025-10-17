@@ -2,13 +2,14 @@ import Redis from 'ioredis';
 import RedisStreamManager from '../services/redis/RedisStreamManager';
 import { REDIS_STREAMS } from '../constants/RedisConstants';
 import RoomData, { RoomDataBase } from '../schemas/Strokes';
-import addToTheRoomAndCheckThreshold from '../scripts/redis/addToTheRoomAndCheckThresholdScript';
-import getRoomBatchDataScript from '../scripts/redis/getRoomBatchDataScript';
+import { addToTheRoomAndCheckThreshold } from '../scripts/redis/addToTheRoomAndCheckThresholdScript';
+import getInflightRoomDataScript from '../scripts/redis/getInflightRoomDataScript';
 import cleanupProcessedStrokesScript from '../scripts/redis/cleanupProcessedStrokesScript';
-import stableHashNumeric from '../utils /stableHash';
+import stableHash from '../utils/stableHash';
 import checkAndDetermineTimeout from '../scripts/redis/checkAndDetermineTimeoutScript';
 import HeartbeatService from '../services/heartbeat/HeartbeatService';
 import { StreamEvents } from '../events/StreamEvents';
+import { json } from 'express';
 
 interface BatchProcessingConfig {
 	strokeCountThreshold: number;
@@ -34,7 +35,9 @@ class PersistenceController {
 	private PORT;
 	private streamEventEmitter: StreamEvents;
 	private redis: Redis;
+	private serverId: string;
 	private redisStreamManager: RedisStreamManager;
+	private activeRoomsKey: string = process.env.ACTIVE_ROOMS_KEY!;
 
 	constructor(
 		PORT: string,
@@ -48,6 +51,13 @@ class PersistenceController {
 		this.streamEventEmitter = streamEventEmitter;
 		this.redisStreamManager = redisStreamManager;
 		this.PORT = PORT;
+		// Server ID priority: process.env.PORT (if set) → config.port (from CLI flag)
+		// This allows multiple dev instances sharing the same .env to have unique IDs
+		// based on their --port flag. Production should use explicit SERVER_ID env vars.
+		const derivedServerId = process.env.PORT
+			? `server-${process.env.PORT}`
+			: undefined;
+		this.serverId = derivedServerId ?? `server-${this.PORT}`;
 		this.heartBeatService = heartBeatService;
 
 		this.config = {
@@ -86,8 +96,8 @@ class PersistenceController {
 				console.error('the PersistenceController hasnt been initialized yet');
 				return;
 			}
-			const roomId = data.roomId;
 
+			const roomId = data[0].roomId;
 			await this.addStrokeToRoom(roomId, data);
 		} catch (error) {
 			console.error('Error handling drawing event:', error);
@@ -96,43 +106,45 @@ class PersistenceController {
 	}
 
 	// ========== Room Management ==========
-	private async addStrokeToRoom(
-		roomId: string,
-		strokeData: any
-	): Promise<void> {
+	private async addStrokeToRoom(roomId: string, data: any): Promise<void> {
 		try {
-			const roomKey = this.getRoomKey(roomId);
-			const strokesKey = this.getRoomStrokesKey(roomId);
+			const inflightHashKey = this.getInflightHashKey(roomId);
+			const inflightMetadataHashKey = this.getInflightMetadataHashKey(roomId);
 			const now = Date.now();
 
 			// This call also set the ActiveRooms
 			const shouldTriggerBatchWriteResult = (await this.redis.eval(
 				addToTheRoomAndCheckThreshold,
 				2, // number of KEYS
-				roomKey,
-				strokesKey,
+				inflightHashKey,
+				inflightMetadataHashKey,
 				roomId,
-				JSON.stringify(strokeData),
+				JSON.stringify(data),
 				now.toString(),
-				this.config.strokeCountThreshold
+				this.config.strokeCountThreshold,
+				this.activeRoomsKey
 			)) as [number, number];
-
-			console.log('strokeData', strokeData);
 
 			const shouldTriggerBatchWrite = shouldTriggerBatchWriteResult[1];
 			const strokeCount = shouldTriggerBatchWriteResult[0];
 			console.log(
 				'added to the room: ',
 				roomId,
-				'the packageId: ',
-				strokeData.packageId,
-				'the rooms',
-				roomId,
-				'stroke count: ',
+				'current room stroke count: ',
 				strokeCount
 			);
+
 			if (shouldTriggerBatchWrite) {
-				await this.acquireLock(roomId);
+				const acquireLockResults = await this.acquireLock(roomId);
+				if (!acquireLockResults) {
+					console.log(
+						' COULDNT acquire the lock another server acquired it for the room: ',
+						roomId
+					);
+					return;
+				}
+				const { lockKey, lockValue } = acquireLockResults;
+				await this.processBatchWriteWithLock(roomId, lockKey, lockValue);
 			}
 		} catch (error) {
 			console.error(`Error adding stroke to room ${roomId}:`, error);
@@ -144,6 +156,7 @@ class PersistenceController {
 		try {
 			if (!this.isInitialized)
 				return 'the PersistenceController hasnt been initialized yet';
+			//todo this is O(N) and shouldnt be used for large scale applications. migration to consistent hash and usage of pub sub is determined to be done by the next version
 			const activeRoomIds = await this.getActiveRoomIds();
 			console.log('activeRoomIds', activeRoomIds);
 
@@ -155,6 +168,7 @@ class PersistenceController {
 			for (let activeRoomId of activeRoomIds) {
 				await this.checkAndProcessTimedOutRoom(activeRoomId);
 			}
+			return;
 		} catch (error) {
 			console.error('Error processing timed-out rooms:', error);
 			return false;
@@ -166,9 +180,10 @@ class PersistenceController {
 			const serverStatus = await this.getActiveServers();
 			const { activeServers } = serverStatus;
 			if (activeServers.length === 0) return null;
+			console.log('activeServers', activeServers);
 
 			const myserverIndex = activeServers.findIndex(
-				(server) => server.port === this.PORT
+				(server) => server.id === this.serverId
 			);
 			if (myserverIndex === -1) {
 				console.log('this server failed to give heartbeat');
@@ -178,7 +193,7 @@ class PersistenceController {
 			const cycle_number = Math.floor(Date.now() / (10 * 1000));
 			console.log('cycle_number', cycle_number);
 			const responsibleIndex =
-				stableHashNumeric(`${roomId}-${cycle_number}`) % activeServers.length;
+				stableHash(`${roomId}-${cycle_number}`) % activeServers.length;
 
 			return responsibleIndex === myserverIndex;
 		} catch (error) {
@@ -189,10 +204,12 @@ class PersistenceController {
 
 	private async checkAndProcessTimedOutRoom(roomId: string): Promise<void> {
 		const maxRetries = 3;
-		for (let attempt = 0; attempt < maxRetries; attempt++) {
+		for (let attempt = 1; attempt <= maxRetries; attempt++) {
 			try {
 				// Watch for server topology changes
-				await this.redis.watch('active_servers_ordered', 'active_servers_data');
+				const ACTIVE_SERVERS_KEY = process.env.ACTIVE_SERVERS_KEY!;
+				const ACTIVE_SERVER_DATA = process.env.ACTIVE_SERVER_DATA!;
+				await this.redis.watch(ACTIVE_SERVERS_KEY, ACTIVE_SERVER_DATA);
 
 				// Check if we're responsible (outside transaction)
 				const isResponsible = await this.isMyRoom(roomId);
@@ -201,15 +218,13 @@ class PersistenceController {
 					return;
 				}
 
-				console.log('serverId', this.PORT, 'isResponsible for:', roomId);
-				const roomKey = this.getRoomKey(roomId);
-				const strokesKey = this.getRoomStrokesKey(roomId);
+				console.log('serverId', this.serverId, 'isResponsible for:', roomId);
+				const inflightMetadataHashKey = this.getInflightMetadataHashKey(roomId);
 
 				const timeoutResult = (await this.redis.eval(
 					checkAndDetermineTimeout,
-					2,
-					roomKey,
-					strokesKey,
+					1,
+					inflightMetadataHashKey,
 					Date.now().toString(),
 					this.config.timeoutMs.toString()
 				)) as [number, string];
@@ -229,49 +244,53 @@ class PersistenceController {
 					strokeCount
 				);
 
-				// Execute empty transaction to detect changes
-				console.log(
-					'before ',
-					await this.redis.zrangebyscore(
-						'active_servers_ordered',
-						'-inf',
-						'+inf'
-					)
-				);
+				// Prepare lock acquisition
+				const lockKeyPrefix = process.env.SERVER_TYPE;
+				const lockKey = `${lockKeyPrefix}lock:room:${roomId}`;
+				const lockValue = `${process.pid}-${Date.now()}`;
 
-				// await this.redis.zremrangebyrank('active_servers_ordered', 1, 1);
+				// Execute transaction with lock acquisition
 				const multi = this.redis.multi();
+				multi.set(lockKey, lockValue, 'EX', 30, 'NX');
 				const result = await multi.exec();
-				// console.log('result', result);
-				// console.log(
-				// 	'after ',
-				// 	await this.redis.zrangebyscore(
-				// 		'active_servers_ordered',
-				// 		'-inf',
-				// 		'+inf'
-				// 	)
-				// );
 
 				if (result === null) {
-					// Server list changed - our calculations are invalid, retry
+					// Server topology changed while checking responsibility and lock acquisation
 					console.log('topology changed');
 					continue;
 				}
 
-				// Server topology didn't change try to acquire lock
-				const lockAcquired = await this.acquireLock(roomId);
+				// Check if we acquired the lock (first command in transaction)
+				const lockAcquired = result[0][1]; // [error, result] tuple
+				console.log('lockAcquired', lockAcquired);
+
 				if (!lockAcquired) {
-					return; // Exit cleanly - another server is handling it
+					console.log(
+						this.serverId,
+						' COULDNT acquire the lock another server acquired it for the room: ',
+						roomId
+					);
+					return; // Another server is handling it
 				}
+
+				console.log(this.serverId, ' acquired the lock for the room: ', roomId);
+				// Process batch write asynchronously
+				// Batch operations are scoped to a single room to maintain data consistency
+				// and simplify cleanup - both write batching and cleanup logic expect one roomId
+				this.processBatchWriteWithLock(roomId, lockKey, lockValue).catch(
+					(error: any) => {
+						console.error(`Batch write failed for room ${roomId}:`, error);
+					}
+				);
 
 				return;
 			} catch (error) {
 				console.error(
-					`Process room ${roomId} attempt ${attempt + 1} failed:`,
+					`Process room ${roomId} attempt ${attempt} failed:`,
 					error
 				);
 				await this.redis.unwatch();
-				if (attempt === maxRetries - 1) {
+				if (attempt === maxRetries + 1) {
 					console.error(
 						`Failed to process room ${roomId} after ${maxRetries} attempts`
 					);
@@ -281,7 +300,8 @@ class PersistenceController {
 	}
 
 	private async acquireLock(roomId: string) {
-		const lockKey = `lock:room:${roomId}`;
+		const lockKeyPrefix = process.env.SERVER_TYPE;
+		const lockKey = `${lockKeyPrefix}lock:room:${roomId}`;
 		const lockValue = `${process.pid}-${Date.now()}`; // unique identifier
 		const acquired = await this.redis.set(
 			lockKey,
@@ -291,24 +311,16 @@ class PersistenceController {
 			'NX'
 		);
 
-		console.log('acquired', acquired);
-
 		if (!acquired) {
 			console.log(
-				`Room ${roomId} is already being processed by another instance`
+				this.serverId,
+				' COULDNT acquire the lock another server acquired it for the room: ',
+				roomId
 			);
 			return false; // Another process is handling this room
 		}
 
-		// Process batch write asynchronously
-		// Batch operations are scoped to a single room to maintain data consistency
-		// and simplify cleanup - both write batching and cleanup logic expect one roomId
-		this.processBatchWriteWithLock(roomId, lockKey, lockValue).catch(
-			(error: any) => {
-				console.error(`Batch write failed for room ${roomId}:`, error);
-			}
-		);
-		return true;
+		return { lockKey, lockValue };
 	}
 
 	// ========== Batch Processing ==========
@@ -321,13 +333,13 @@ class PersistenceController {
 			// get the roomData via lua script
 			const raw = await this.getRoomBatchData(roomId);
 
-			const batchData: RoomBatchData = {
-				strokeCount: raw.strokeCount,
-				strokesData: raw.strokesData,
-				isTimedOut: raw.isTimedOut,
-			};
+			let batchData: string[] = [];
+			for (let i = 0; i < raw.length; i += 2) {
+				const data = raw[i + 1];
+				batchData.push(data);
+			}
 
-			const validStrokes = this.parseAndValidateStrokes(batchData.strokesData);
+			const validStrokes = this.parseAndValidateStrokes(batchData);
 			if (validStrokes.length === 0) {
 				console.log('No valid strokes to process');
 				await this.removeFromActiveRooms(roomId);
@@ -364,27 +376,16 @@ class PersistenceController {
 	}
 
 	// ========== Data Retrieval Helpers ==========
-	private async getRoomBatchData(roomId: string) {
-		const roomKey = this.getRoomKey(roomId);
-		const strokesKey = this.getRoomStrokesKey(roomId);
+	private async getRoomBatchData(roomId: string): Promise<string[]> {
+		const inflightHashKey = this.getInflightHashKey(roomId);
 
-		const res = await this.redis.eval(
-			getRoomBatchDataScript,
-			2, // number of KEYS
-			roomKey,
-			strokesKey
-		);
-		const [strokeCountStr, strokesData, isTimedOutStr] = res as [
-			string,
-			string[],
-			string,
-		];
+		const res = (await this.redis.eval(
+			getInflightRoomDataScript,
+			1, // number of KEYS
+			inflightHashKey
+		)) as string[];
 
-		return {
-			strokeCount: parseInt(strokeCountStr || '0'),
-			strokesData,
-			isTimedOut: isTimedOutStr === '1',
-		};
+		return res;
 	}
 
 	private parseAndValidateStrokes(strokesData: string[]): RoomDataBase[] {
@@ -487,52 +488,42 @@ class PersistenceController {
 		roomId: string,
 		processedStrokes: RoomDataBase[]
 	): Promise<void> {
-		const roomKey = this.getRoomKey(roomId);
-		const strokesKey = this.getRoomStrokesKey(roomId);
-
 		try {
-			// Prepare arguments for Lua script
-			const strokeJsonStrings = processedStrokes.map((stroke) =>
-				JSON.stringify(stroke)
-			);
-
-			console.log('processedStrokes', processedStrokes);
+			// Each batch processes a single room. Persisted strokes are moved to a room-specific
+			// hash to be used and clear by snapshot servers
+			const persistedRoomsKey = this.getPersistedRoomsKey(roomId);
+			const inflightHashKey = this.getInflightHashKey(roomId);
+			const inflightMetadataHashKey = this.getInflightMetadataHashKey(roomId);
 
 			const args = [
-				processedStrokes.length.toString(),
 				Date.now().toString(),
-				...strokeJsonStrings,
+				this.activeRoomsKey,
+				JSON.stringify(processedStrokes),
+				roomId,
 			];
 
 			const result = (await this.redis.eval(
 				cleanupProcessedStrokesScript,
-				2, // Number of KEYS
-				roomKey,
-				strokesKey,
+				3, // Number of KEYS
+				inflightHashKey,
+				inflightMetadataHashKey,
+				persistedRoomsKey,
 				...args
-			)) as [number, number, number];
+			)) as [number, number, string[]];
 
-			const [removedCount, newCount, previousCount] = result;
+			const [newCount, removedCount, processedStrokesRedisMessageIds] = result;
 
 			console.log(`Cleanup results for room ${roomId}:`, {
-				processedStrokes: processedStrokes.length,
-				actuallyRemoved: removedCount,
-				previousCount,
+				processedStrokes: processedStrokesRedisMessageIds.length,
+				removedFromInflight: removedCount,
 				newCount,
 			});
 
-			const redisMessageIds = processedStrokes.map((i) => i.redisMessageId);
-
 			// All operations were done by roomId so one roomId is enough
 			this.streamEventEmitter.emitPersistedPackages({
-				redisMessageIds,
+				redisMessageIds: processedStrokesRedisMessageIds,
 				roomId,
 			});
-
-			// Remove room from active rooms if no strokes left
-			if (newCount === 0) {
-				await this.removeFromActiveRooms(roomId);
-			}
 		} catch (error) {
 			console.error(
 				`Failed to cleanup processed strokes for room ${roomId}:`,
@@ -545,21 +536,24 @@ class PersistenceController {
 	private cleanup() {}
 
 	// ========== Redis Helper Methods ==========
-
-	private getRoomKey(roomId: string): string {
-		return `room:${roomId}`;
+	private getInflightHashKey(roomId: string): string {
+		return `${process.env.INFLIGHT_HASH_KEY_PREFIX}${roomId}`;
 	}
 
-	private getRoomStrokesKey(roomId: string): string {
-		return `room:${roomId}:strokes`;
+	private getInflightMetadataHashKey(roomId: string): string {
+		return `${process.env.INFLIGHT_HASH_METADATA_KEY_PREFIX}${roomId}`;
+	}
+
+	private getPersistedRoomsKey(roomId: string): string {
+		return `${process.env.PERSISTED_ROOMS_KEY_PREFIX}${roomId}`;
 	}
 
 	private async getActiveRoomIds(): Promise<string[]> {
-		return await this.redis.smembers('activeRooms');
+		return await this.redis.smembers(this.activeRoomsKey);
 	}
 
 	private async removeFromActiveRooms(roomId: string): Promise<void> {
-		await this.redis.srem('activeRooms', roomId);
+		await this.redis.srem(this.activeRoomsKey, roomId);
 	}
 
 	private async getActiveServers() {

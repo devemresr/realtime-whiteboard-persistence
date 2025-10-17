@@ -9,6 +9,5 @@ export const REDIS_CONSUMER_GROUPS = {
 } as const;
 
 export const REDIS_CLIENTS = {
-	CACHE: 'cacheClient',
-	STREAM: 'streamClient',
+	MAIN: 'mainClient',
 } as const;
